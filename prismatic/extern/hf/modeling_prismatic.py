@@ -447,6 +447,30 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
 
     # === GenerationMixin Methods ===
+    def _validate_model_kwargs(self, model_kwargs: Dict[str, Any]) -> None:
+        """Strip Prismatic-specific kwargs before deferring to HF validation.
+
+        ``transformers>=4.42`` validates the kwargs passed to ``generate`` against
+        the model's ``forward`` signature and raises a ``ValueError`` for
+        unknown entries.  Our higher-level helpers consume several OpenVLA
+        specific kwargs (e.g. ``cot_token_budget``) prior to calling
+        ``generate``, but this validation hook still encounters them when users
+        forward the kwargs directly.  We therefore drop the known custom keys
+        here and then delegate to the default validation logic.
+        """
+
+        ignored_keys = {
+            "cot_token_budget",
+            "prioritize_cot",
+            "return_hidden_states",
+            "return_cot",
+            "tokenizer",
+        }
+        for key in ignored_keys:
+            model_kwargs.pop(key, None)
+
+        super()._validate_model_kwargs(model_kwargs)
+
     def prepare_inputs_for_generation(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -504,9 +528,23 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         self.vocab_size = self.config.text_config.vocab_size - self.config.pad_to_multiple_of
 
     def predict_action(
-        self, input_ids: Optional[torch.LongTensor] = None, unnorm_key: Optional[str] = None, **kwargs: str
-    ) -> np.ndarray:
-        """Thin wrapper around super().generate() that decodes predicted actions and de-normalizes them."""
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        unnorm_key: Optional[str] = None,
+        **kwargs: str,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, torch.Tensor], Dict[str, Any]]:
+        """Thin wrapper around ``generate`` that optionally returns hidden states and CoT text."""
+
+        cot_token_budget: int = int(kwargs.pop("cot_token_budget", 0))
+        prioritize_cot: bool = bool(kwargs.pop("prioritize_cot", False)) and cot_token_budget > 0
+        return_hidden_states: bool = bool(kwargs.pop("return_hidden_states", False))
+        return_dict: bool = bool(kwargs.pop("return_dict", False))
+        tokenizer = kwargs.pop("tokenizer", None)
+
+        # CoT text can only be produced when we decode the intermediate tokens
+        return_cot: bool = bool(kwargs.pop("return_cot", False)) or tokenizer is not None
+        return_hidden_states = return_hidden_states or return_dict
+        return_dict = return_dict or return_hidden_states or return_cot
 
         # We need to add this special empty token ('') after the colon (':') token in "ASSISTANT:"
         # in order for the predictions to match the training configuration and be accurate.
@@ -514,11 +552,89 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
         )
 
-        # Run VLA inference
-        generated_ids = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)
+        # Ensure the attention mask matches the appended token (if provided)
+        attention_mask = kwargs.get("attention_mask")
+        if attention_mask is not None:
+            ones = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype, device=attention_mask.device)
+            attention_mask = torch.cat([attention_mask, ones], dim=-1)
+            kwargs["attention_mask"] = attention_mask
+
+        prompt_len = input_ids.shape[-1]
+        action_token_count = self.get_action_dim(unnorm_key)
+        generation_kwargs = dict(kwargs)
+
+        cot_token_ids = input_ids[:, :0]
+        cot_text = None
+
+        if prioritize_cot:
+            if tokenizer is None:
+                raise ValueError("`tokenizer` must be provided when `prioritize_cot` is enabled.")
+
+            # Stage 1: generate Chain-of-Thought tokens only (no streamer to avoid premature finalization)
+            cot_kwargs = dict(generation_kwargs)
+            cot_kwargs.pop("streamer", None)
+            cot_generated = self.generate(input_ids, max_new_tokens=cot_token_budget, **cot_kwargs)
+            cot_sequences = cot_generated.sequences if hasattr(cot_generated, "sequences") else cot_generated
+            cot_new_tokens = cot_sequences.shape[-1] - prompt_len
+            cot_token_ids = cot_sequences[:, prompt_len:]
+
+            if tokenizer is not None and cot_token_ids.numel() > 0:
+                decoded = tokenizer.decode(cot_token_ids[0], skip_special_tokens=True)
+                cot_text = decoded.strip() or None
+
+            if attention_mask is not None and cot_new_tokens > 0:
+                ones = torch.ones(
+                    (attention_mask.shape[0], cot_new_tokens),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                prefill_attention_mask = torch.cat([attention_mask, ones], dim=-1)
+            else:
+                prefill_attention_mask = attention_mask
+
+            prefill_input_ids = cot_sequences
+
+            # Ensure "Action Tokens:" prompt exists before action generation
+            action_prompt_ids = None
+            cot_text_for_prompt = cot_text or ""
+            if "Action Tokens:" not in cot_text_for_prompt:
+                action_prompt = "\nAction Tokens:" if cot_text_for_prompt else "Action Tokens:"
+                action_prompt_ids = tokenizer(
+                    action_prompt, add_special_tokens=False, return_tensors="pt"
+                ).input_ids.to(prefill_input_ids.device)
+                prefill_input_ids = torch.cat([prefill_input_ids, action_prompt_ids], dim=-1)
+
+            if prefill_attention_mask is not None and action_prompt_ids is not None:
+                action_prompt_mask = torch.ones(
+                    (prefill_attention_mask.shape[0], action_prompt_ids.shape[-1]),
+                    dtype=prefill_attention_mask.dtype,
+                    device=prefill_attention_mask.device,
+                )
+                prefill_attention_mask = torch.cat([prefill_attention_mask, action_prompt_mask], dim=-1)
+
+            # Stage 2: generate action tokens conditioned on CoT context
+            action_kwargs = dict(generation_kwargs)
+            if prefill_attention_mask is not None:
+                action_kwargs["attention_mask"] = prefill_attention_mask
+            else:
+                action_kwargs.pop("attention_mask", None)
+
+            generated = self.generate(
+                prefill_input_ids, max_new_tokens=action_token_count, **action_kwargs
+            )
+            generated_ids = generated.sequences if hasattr(generated, "sequences") else generated
+            prompt_len = prefill_input_ids.shape[-1]
+            attention_mask = prefill_attention_mask
+        else:
+            max_new_tokens = action_token_count + max(cot_token_budget, 0)
+
+            # Run VLA inference
+            generated = self.generate(input_ids, max_new_tokens=max_new_tokens, **generation_kwargs)
+            generated_ids = generated.sequences if hasattr(generated, "sequences") else generated
 
         # Extract predicted action tokens and translate into (normalized) continuous actions
-        predicted_action_token_ids = generated_ids[0, -self.get_action_dim(unnorm_key) :].cpu().numpy()
+        action_token_slice = generated_ids[:, -action_token_count:]
+        predicted_action_token_ids = action_token_slice[0].to("cpu").numpy()
         discretized_actions = self.vocab_size - predicted_action_token_ids
         discretized_actions = np.clip(discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1)
         normalized_actions = self.bin_centers[discretized_actions]
@@ -533,7 +649,72 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions,
         )
 
-        return actions
+        if not return_dict:
+            if return_hidden_states:
+                # Backward compatibility: return tuple when hidden states requested but dictionary not needed
+                hidden_states = self._compute_action_hidden_states(
+                    generated_ids, attention_mask, kwargs.get("pixel_values"), action_token_count
+                )
+                return actions, hidden_states
+            return actions
+
+        hidden_states = self._compute_action_hidden_states(
+            generated_ids, attention_mask, kwargs.get("pixel_values"), action_token_count
+        )
+
+        if not prioritize_cot:
+            total_new_tokens = generated_ids.shape[-1] - prompt_len
+            extra_token_count = max(total_new_tokens - action_token_count, 0)
+            if extra_token_count > 0:
+                cot_token_ids = generated_ids[:, prompt_len : prompt_len + extra_token_count]
+                if tokenizer is not None:
+                    decoded = tokenizer.decode(cot_token_ids[0], skip_special_tokens=True)
+                    cot_text = decoded.strip()
+
+        result: Dict[str, Any] = {
+            "actions": actions,
+            "hidden_states": hidden_states,
+            "cot_token_ids": cot_token_ids,
+            "cot_text": cot_text,
+            "action_token_ids": action_token_slice,
+        }
+
+        return result
+
+    def _compute_action_hidden_states(
+        self,
+        generated_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor],
+        pixel_values: Optional[torch.Tensor],
+        action_token_count: int,
+    ) -> torch.Tensor:
+        """Re-run the forward pass to recover hidden states for the generated action tokens."""
+
+        if attention_mask is not None:
+            new_token_count = generated_ids.shape[-1] - attention_mask.shape[-1]
+            if new_token_count > 0:
+                ones = torch.ones(
+                    (attention_mask.shape[0], new_token_count),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                extended_attention_mask = torch.cat([attention_mask, ones], dim=-1)
+            else:
+                extended_attention_mask = attention_mask
+        else:
+            extended_attention_mask = None
+
+        with torch.inference_mode():
+            forward_outputs = super().forward(
+                input_ids=generated_ids,
+                attention_mask=extended_attention_mask,
+                pixel_values=pixel_values,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+
+        last_hidden = forward_outputs.hidden_states[-1]
+        return last_hidden[:, -action_token_count:, :]
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:
