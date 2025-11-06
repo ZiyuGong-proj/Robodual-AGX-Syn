@@ -8,7 +8,7 @@ import time
 import math
 from dataclasses import dataclass
 
-from typing import Optional
+from typing import List, Optional
 from transformers.generation.streamers import BaseStreamer
 
 
@@ -165,6 +165,23 @@ class TimingAggregator:
         return 1.0 / mean
 #add1_end
 
+
+@dataclass
+class GeneralistPrompt:
+    """Container describing a queued generalist prompt."""
+
+    kind: str
+    inputs: dict
+
+
+def get_openvla_cot_prompt(instruction: str) -> str:
+    return (
+        "In: Consider the robot's current observation and reason step by step "
+        f"about how to {instruction.lower()}.\n"
+        "Thought:"
+    )
+
+
 def get_openvla_prompt(instruction: str, tokenized_action: str = None) -> str:
     return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
 
@@ -229,6 +246,12 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         self._control_stats = TimingAggregator()
         #add2_end
 
+        # Chain-of-thought bookkeeping
+        self._cot_token_limit = 128
+        self._generalist_prompt_queue: List[GeneralistPrompt] = []
+        self._cot_history: List[str] = []
+        self._last_reasoning: Optional[str] = None
+
         
     def reset(self,):
         """
@@ -239,6 +262,9 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         self.action_buffer_mask = np.zeros((self.temporal_mask.shape[0], self.temporal_mask.shape[0]), dtype=np.bool_)
         self.obs_buffer = None
         self.hist_action = []
+        self._generalist_prompt_queue.clear()
+        self._cot_history.clear()
+        self._last_reasoning = None
 
 
     def step(self, obs, instruction, step):
@@ -251,6 +277,7 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         """
 
         image = obs["rgb_obs"]['rgb_static']
+        pil_image = Image.fromarray(image)
         gripper_image = obs["rgb_obs"]['rgb_gripper']
         #gripper_image = self.processor.image_processor.apply_transform(Image.fromarray(gripper_image))[:3].unsqueeze(0).to(self.dual_sys.device)
         gripper_image = self.processor.image_processor.apply_transform(Image.fromarray(gripper_image))[:3].unsqueeze(0).to(self.device)
@@ -261,39 +288,49 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         depth_gripper = torch.from_numpy(obs["depth_obs"]['depth_gripper']).unsqueeze(0).to(self.device) - self.gripper_depth_min / (self.gripper_depth_max - self.gripper_depth_min)
 
         prompt = get_openvla_prompt(instruction)
-        inputs = self.processor(prompt, Image.fromarray(image)).to(self.device, dtype=torch.bfloat16)
+        inputs = self.processor(prompt, pil_image).to(self.device, dtype=torch.bfloat16)
 
 
-        if (step + 1) % 8 == 0 or step == 0: 
+        if (step + 1) % 8 == 0 or step == 0:
             # Run VLA Inference
             #add3
             generalist_start = time.perf_counter()
             #add3_end
-            #action, hidden_states = self.dual_impl.slow_system.predict_action(**inputs, do_sample=False)
-            ############################################
-            streamer = ActionTokenTimingStreamer(device=self.device)
-            streamer.start()
-            action, hidden_states = self.dual_impl.slow_system.predict_action(
-                streamer=streamer, do_sample=False, **inputs
+            self._generalist_prompt_queue = self._prepare_generalist_prompts(
+                pil_image, instruction, inputs
             )
-            streamer.finalize()
-            timing_metrics = streamer.get_metrics()
-            if timing_metrics is not None:
-                ttft = timing_metrics["ttft"]
-                tpot = timing_metrics["tpot"]
-                self.ttft_records.append(ttft)
-                self.tpot_records.append(tpot)
-                print(
-                    f"[Latency][System-2] Step {step}: TTFT={ttft:.4f}s, TPOT={tpot:.4f}s, Tokens={timing_metrics['token_count']}"
+
+            for prompt_request in self._generalist_prompt_queue:
+                if prompt_request.kind == "cot":
+                    self._run_generalist_cot(prompt_request.inputs, step)
+                    continue
+
+                ############################################
+                streamer = ActionTokenTimingStreamer(device=self.device)
+                streamer.start()
+                action, hidden_states = self.dual_impl.slow_system.predict_action(
+                    streamer=streamer, do_sample=False, **prompt_request.inputs
                 )
-            ##################################
-            #add4
-            self._generalist_stats.update(time.perf_counter() - generalist_start)
-            #add4_end
-            action = torch.tensor(action).to(hidden_states.device).unsqueeze(0)
-            action = rearrange(action, 'b (f d) -> b f d', f=8)
-            self.action = action[:,:,:7]
-            self.hidden_states = hidden_states
+                streamer.finalize()
+                timing_metrics = streamer.get_metrics()
+                if timing_metrics is not None:
+                    ttft = timing_metrics["ttft"]
+                    tpot = timing_metrics["tpot"]
+                    self.ttft_records.append(ttft)
+                    self.tpot_records.append(tpot)
+                    print(
+                        f"[Latency][System-2] Step {step}: TTFT={ttft:.4f}s, TPOT={tpot:.4f}s, Tokens={timing_metrics['token_count']}"
+                    )
+                ##################################
+                #add4
+                self._generalist_stats.update(time.perf_counter() - generalist_start)
+                #add4_end
+                action = torch.tensor(action).to(hidden_states.device).unsqueeze(0)
+                action = rearrange(action, 'b (f d) -> b f d', f=8)
+                self.action = action[:,:,:7]
+                self.hidden_states = hidden_states
+
+            self._generalist_prompt_queue.clear()
 
 
         num_cond_actions = 8 - (step + 1) % 8
@@ -365,6 +402,51 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         self.hist_action.append(torch.from_numpy(action_prediction))
 
         return action_prediction
+
+    def _prepare_generalist_prompts(
+        self,
+        image: Image.Image,
+        instruction: str,
+        action_inputs,
+    ) -> List[GeneralistPrompt]:
+        queue: List[GeneralistPrompt] = []
+
+        cot_prompt = get_openvla_cot_prompt(instruction)
+        cot_inputs = self.processor(cot_prompt, image).to(self.device, dtype=torch.bfloat16)
+        queue.append(GeneralistPrompt(kind="cot", inputs=cot_inputs))
+
+        queue.append(GeneralistPrompt(kind="action", inputs=action_inputs))
+        return queue
+
+    def _run_generalist_cot(self, inputs, step: int) -> None:
+        tokenizer = getattr(self.processor, "tokenizer", None)
+
+        generation_kwargs = {"max_new_tokens": self._cot_token_limit, "do_sample": False}
+        if tokenizer is not None and getattr(tokenizer, "eos_token_id", None) is not None:
+            generation_kwargs.setdefault("pad_token_id", tokenizer.eos_token_id)
+
+        with torch.inference_mode():
+            generation = self.dual_impl.slow_system.generate(**inputs, **generation_kwargs)
+
+        if hasattr(generation, "sequences"):
+            generated_ids = generation.sequences
+        else:
+            generated_ids = generation
+
+        prompt_length = inputs["input_ids"].shape[-1]
+        new_token_ids = generated_ids[0, prompt_length:]
+
+        reasoning_text = ""
+        if tokenizer is not None:
+            reasoning_text = tokenizer.decode(new_token_ids, skip_special_tokens=True).strip()
+
+        if reasoning_text:
+            print(f"[Reasoning][System-2] Step {step}: {reasoning_text}")
+        else:
+            print(f"[Reasoning][System-2] Step {step}: <no reasoning generated>")
+
+        self._last_reasoning = reasoning_text
+        self._cot_history.append(reasoning_text)
     #add7
     def record_control_cycle(self, duration: float) -> None:
         self._control_stats.update(duration)
