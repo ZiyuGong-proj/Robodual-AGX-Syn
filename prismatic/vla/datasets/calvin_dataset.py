@@ -56,7 +56,7 @@ import logging
 import os
 from pathlib import Path
 import re
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple, Union
 
 import numpy as np
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -75,6 +75,27 @@ from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
+
+
+CALVIN_INSTRUCTION_SUFFIX = " Let’s think step by step"
+
+
+def _append_calvin_instruction_suffix(value: Any) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    text = str(value).strip()
+    suffix = CALVIN_INSTRUCTION_SUFFIX.strip()
+    if text.endswith(suffix):
+        return text
+    return f"{text}{CALVIN_INSTRUCTION_SUFFIX}"
+
+
+def format_calvin_instruction_for_prompt(value: Any) -> str:
+    appended = _append_calvin_instruction_suffix(value)
+    if appended.endswith(CALVIN_INSTRUCTION_SUFFIX):
+        prefix = appended[: -len(CALVIN_INSTRUCTION_SUFFIX)]
+        return f"{prefix.lower()}{CALVIN_INSTRUCTION_SUFFIX}"
+    return appended.lower()
 
 
 def process_state(
@@ -462,11 +483,21 @@ class BaseCalvinDataset(Dataset):
     def process_language(
         self, episode: Dict[str, np.ndarray], transforms: Dict, with_lang: bool
     ):
-        return {"lang": episode["language"]}
+        language: Union[str, np.ndarray, bytes] = episode["language"]
+
+        if isinstance(language, np.ndarray):
+            if language.ndim == 0 or language.size == 1:
+                language = language.item()
+            else:
+                vectorized = np.vectorize(_append_calvin_instruction_suffix, otypes=[object])
+                return {"lang": vectorized(language)}
+
+        return {"lang": _append_calvin_instruction_suffix(language)}
 
     def get_openvla_prompt(self, instruction: str, tokenized_action: str = None) -> str:
-    # print(tokenized_action)
-        return f"In: What action should the robot take to {instruction.lower()}?\nOut:" #+ tokenized_action + "</s>"
+        # print(tokenized_action)
+        prompt_instruction = format_calvin_instruction_for_prompt(instruction)
+        return f"In: What action should the robot take to {prompt_instruction}?\nOut:"
 
     def __getitem__(self, idx: Union[int, Tuple[int, int]], fixed_seed=False) -> Dict:
         """
@@ -983,9 +1014,10 @@ def preprocess_image(sample, image_processor):
 def preprocess_text_calvin(sample, tokenizer):
     tokenizer.padding_side = "right"
     sample = [
-        # (f"{s.strip()}{tokenizer.eos_token}")
-        # for s in sample
-        (f"<image>{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample
+        (
+            f"<image>{_append_calvin_instruction_suffix(s)}<|endofchunk|>{tokenizer.eos_token}"
+        )
+        for s in sample
     ]
     text = tokenizer(
         sample,
