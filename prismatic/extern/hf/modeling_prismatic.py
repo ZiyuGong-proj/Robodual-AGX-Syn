@@ -447,6 +447,30 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
 
     # === GenerationMixin Methods ===
+    def _validate_model_kwargs(self, model_kwargs: Dict[str, Any]) -> None:
+        """Strip Prismatic-specific kwargs before deferring to HF validation.
+
+        ``transformers>=4.42`` validates the kwargs passed to ``generate`` against
+        the model's ``forward`` signature and raises a ``ValueError`` for
+        unknown entries.  Our higher-level helpers consume several OpenVLA
+        specific kwargs (e.g. ``cot_token_budget``) prior to calling
+        ``generate``, but this validation hook still encounters them when users
+        forward the kwargs directly.  We therefore drop the known custom keys
+        here and then delegate to the default validation logic.
+        """
+
+        ignored_keys = {
+            "cot_token_budget",
+            "prioritize_cot",
+            "return_hidden_states",
+            "return_cot",
+            "tokenizer",
+        }
+        for key in ignored_keys:
+            model_kwargs.pop(key, None)
+
+        super()._validate_model_kwargs(model_kwargs)
+
     def prepare_inputs_for_generation(
         self,
         input_ids: Optional[torch.Tensor] = None,
