@@ -166,7 +166,12 @@ class TimingAggregator:
 #add1_end
 
 def get_openvla_prompt(instruction: str, tokenized_action: str = None) -> str:
-    return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+    return (
+        "You are a robotics assistant that plans with explicit chain-of-thought reasoning before emitting action tokens.\n"
+        "Respond in two parts: first provide your reasoning prefixed with 'Thought:', then output only the action tokens on "
+        "a new line prefixed with 'Action Tokens:' with no additional commentary after the tokens.\n"
+        f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+    )
 
 
 class DualSystemCalvinEvaluation(CalvinBaseModel):
@@ -193,9 +198,12 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         self.processor = processor
         self.dual_sys = model
         self.dual_impl = getattr(self.dual_sys, "module", self.dual_sys)
-        
+
 
         self.action_tokenizer = action_tokenizer
+
+        # Allow the generalist to allocate additional generation budget for chain-of-thought tokens
+        self.cot_token_budget = 64
 
         self.temporal_size = 8
         self.temporal_mask = torch.flip(torch.triu(torch.ones(self.temporal_size, self.temporal_size, dtype=torch.bool)), dims=[1]).numpy()
@@ -273,9 +281,20 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
             ############################################
             streamer = ActionTokenTimingStreamer(device=self.device)
             streamer.start()
-            action, hidden_states = self.dual_impl.slow_system.predict_action(
-                streamer=streamer, do_sample=False, **inputs
+            generalist_output = self.dual_impl.slow_system.predict_action(
+                streamer=streamer,
+                do_sample=False,
+                cot_token_budget=self.cot_token_budget,
+                return_dict=True,
+                return_hidden_states=True,
+                tokenizer=self.processor.tokenizer,
+                **inputs,
             )
+            action = generalist_output["actions"]
+            hidden_states = generalist_output["hidden_states"]
+            cot_text = generalist_output.get("cot_text")
+            if cot_text:
+                print(f"[Generalist][CoT] Step {step}: {cot_text}")
             streamer.finalize()
             timing_metrics = streamer.get_metrics()
             if timing_metrics is not None:
