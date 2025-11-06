@@ -11,6 +11,8 @@ import torch
 from PIL import Image
 from transformers import AutoModelForVision2Seq, AutoProcessor
 
+from prismatic.vla.datasets.calvin_dataset import format_calvin_instruction_for_prompt
+
 # === Verification Arguments
 MODEL_PATH = "openvla/openvla-7b"
 SYSTEM_PROMPT = (
@@ -21,10 +23,11 @@ INSTRUCTION = "put spoon on towel"
 
 
 def get_openvla_prompt(instruction: str) -> str:
+    prompt_instruction = format_calvin_instruction_for_prompt(instruction)
     if "v01" in MODEL_PATH:
-        return f"{SYSTEM_PROMPT} USER: What action should the robot take to {instruction.lower()}? ASSISTANT:"
+        return f"{SYSTEM_PROMPT} USER: What action should the robot take to {prompt_instruction}? ASSISTANT:"
     else:
-        return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+        return f"In: What action should the robot take to {prompt_instruction}?\nOut:"
 
 
 @torch.inference_mode()

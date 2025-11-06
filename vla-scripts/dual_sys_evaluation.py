@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Optional
 from transformers.generation.streamers import BaseStreamer
 
+from prismatic.vla.datasets.calvin_dataset import format_calvin_instruction_for_prompt
+
 
 from calvin_agent.models.calvin_base_model import CalvinBaseModel
 
@@ -166,7 +168,8 @@ class TimingAggregator:
 #add1_end
 
 def get_openvla_prompt(instruction: str, tokenized_action: str = None) -> str:
-    return f"In: What action should the robot take to {instruction.lower()}?\nOut:"
+    prompt_instruction = format_calvin_instruction_for_prompt(instruction)
+    return f"In: What action should the robot take to {prompt_instruction}?\nOut:"
 
 
 class DualSystemCalvinEvaluation(CalvinBaseModel):
