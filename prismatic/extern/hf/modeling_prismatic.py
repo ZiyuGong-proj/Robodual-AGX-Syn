@@ -512,6 +512,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         """Thin wrapper around ``generate`` that optionally returns hidden states and CoT text."""
 
         cot_token_budget: int = int(kwargs.pop("cot_token_budget", 0))
+        prioritize_cot: bool = bool(kwargs.pop("prioritize_cot", False)) and cot_token_budget > 0
         return_hidden_states: bool = bool(kwargs.pop("return_hidden_states", False))
         return_dict: bool = bool(kwargs.pop("return_dict", False))
         tokenizer = kwargs.pop("tokenizer", None)
@@ -536,11 +537,76 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         prompt_len = input_ids.shape[-1]
         action_token_count = self.get_action_dim(unnorm_key)
-        max_new_tokens = action_token_count + max(cot_token_budget, 0)
+        generation_kwargs = dict(kwargs)
 
-        # Run VLA inference
-        generated = self.generate(input_ids, max_new_tokens=max_new_tokens, **kwargs)
-        generated_ids = generated.sequences if hasattr(generated, "sequences") else generated
+        cot_token_ids = input_ids[:, :0]
+        cot_text = None
+
+        if prioritize_cot:
+            if tokenizer is None:
+                raise ValueError("`tokenizer` must be provided when `prioritize_cot` is enabled.")
+
+            # Stage 1: generate Chain-of-Thought tokens only (no streamer to avoid premature finalization)
+            cot_kwargs = dict(generation_kwargs)
+            cot_kwargs.pop("streamer", None)
+            cot_generated = self.generate(input_ids, max_new_tokens=cot_token_budget, **cot_kwargs)
+            cot_sequences = cot_generated.sequences if hasattr(cot_generated, "sequences") else cot_generated
+            cot_new_tokens = cot_sequences.shape[-1] - prompt_len
+            cot_token_ids = cot_sequences[:, prompt_len:]
+
+            if tokenizer is not None and cot_token_ids.numel() > 0:
+                decoded = tokenizer.decode(cot_token_ids[0], skip_special_tokens=True)
+                cot_text = decoded.strip() or None
+
+            if attention_mask is not None and cot_new_tokens > 0:
+                ones = torch.ones(
+                    (attention_mask.shape[0], cot_new_tokens),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                prefill_attention_mask = torch.cat([attention_mask, ones], dim=-1)
+            else:
+                prefill_attention_mask = attention_mask
+
+            prefill_input_ids = cot_sequences
+
+            # Ensure "Action Tokens:" prompt exists before action generation
+            action_prompt_ids = None
+            cot_text_for_prompt = cot_text or ""
+            if "Action Tokens:" not in cot_text_for_prompt:
+                action_prompt = "\nAction Tokens:" if cot_text_for_prompt else "Action Tokens:"
+                action_prompt_ids = tokenizer(
+                    action_prompt, add_special_tokens=False, return_tensors="pt"
+                ).input_ids.to(prefill_input_ids.device)
+                prefill_input_ids = torch.cat([prefill_input_ids, action_prompt_ids], dim=-1)
+
+            if prefill_attention_mask is not None and action_prompt_ids is not None:
+                action_prompt_mask = torch.ones(
+                    (prefill_attention_mask.shape[0], action_prompt_ids.shape[-1]),
+                    dtype=prefill_attention_mask.dtype,
+                    device=prefill_attention_mask.device,
+                )
+                prefill_attention_mask = torch.cat([prefill_attention_mask, action_prompt_mask], dim=-1)
+
+            # Stage 2: generate action tokens conditioned on CoT context
+            action_kwargs = dict(generation_kwargs)
+            if prefill_attention_mask is not None:
+                action_kwargs["attention_mask"] = prefill_attention_mask
+            else:
+                action_kwargs.pop("attention_mask", None)
+
+            generated = self.generate(
+                prefill_input_ids, max_new_tokens=action_token_count, **action_kwargs
+            )
+            generated_ids = generated.sequences if hasattr(generated, "sequences") else generated
+            prompt_len = prefill_input_ids.shape[-1]
+            attention_mask = prefill_attention_mask
+        else:
+            max_new_tokens = action_token_count + max(cot_token_budget, 0)
+
+            # Run VLA inference
+            generated = self.generate(input_ids, max_new_tokens=max_new_tokens, **generation_kwargs)
+            generated_ids = generated.sequences if hasattr(generated, "sequences") else generated
 
         # Extract predicted action tokens and translate into (normalized) continuous actions
         action_token_slice = generated_ids[:, -action_token_count:]
@@ -572,15 +638,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             generated_ids, attention_mask, kwargs.get("pixel_values"), action_token_count
         )
 
-        cot_text = None
-        cot_token_ids = generated_ids[:, :0]
-        total_new_tokens = generated_ids.shape[-1] - prompt_len
-        extra_token_count = max(total_new_tokens - action_token_count, 0)
-        if extra_token_count > 0:
-            cot_token_ids = generated_ids[:, prompt_len : prompt_len + extra_token_count]
-            if tokenizer is not None:
-                decoded = tokenizer.decode(cot_token_ids[0], skip_special_tokens=True)
-                cot_text = decoded.strip()
+        if not prioritize_cot:
+            total_new_tokens = generated_ids.shape[-1] - prompt_len
+            extra_token_count = max(total_new_tokens - action_token_count, 0)
+            if extra_token_count > 0:
+                cot_token_ids = generated_ids[:, prompt_len : prompt_len + extra_token_count]
+                if tokenizer is not None:
+                    decoded = tokenizer.decode(cot_token_ids[0], skip_special_tokens=True)
+                    cot_text = decoded.strip()
 
         result: Dict[str, Any] = {
             "actions": actions,

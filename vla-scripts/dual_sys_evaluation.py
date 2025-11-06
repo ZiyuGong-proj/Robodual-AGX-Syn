@@ -285,6 +285,7 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
                 streamer=streamer,
                 do_sample=False,
                 cot_token_budget=self.cot_token_budget,
+                prioritize_cot=True,
                 return_dict=True,
                 return_hidden_states=True,
                 tokenizer=self.processor.tokenizer,
